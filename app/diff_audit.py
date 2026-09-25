@@ -7,6 +7,14 @@ start with ``+``) are audited: file headers, removed lines (``-``),
 context lines (a leading space) and the ``\\ No newline at end of file``
 marker are parsed for structure but never analysed.
 
+Per file section the ``---`` / ``+++`` headers are tracked as a pair.  A
+text hunk is only entered when both headers are present in the correct
+order; a section ending after ``---`` without its ``+++`` (at the first
+line that proves it: the next section header or end of input) and a
+duplicated ``+++`` make the diff invalid.  ``+++ /dev/null`` deletion
+sections, metadata-only preambles (mode/rename/empty-file sections) and
+binary patches stay valid even though they carry no text hunk.
+
 For every file containing added lines the added text is rebuilt in
 new-file order and fed to :func:`app.bidi.parse_bidi`.  Every parser
 finding (control character, error, dangerous span) is then mapped back to
@@ -108,6 +116,7 @@ class FilePatch:
     new_path: Optional[str]
     header_line: int          # diff line of the section start / '---' header
     plus_line: Optional[int]  # diff line of the '+++' header
+    minus_line: Optional[int] = None  # diff line of the '---' header
     hunks: list[_Hunk] = field(default_factory=list)
     binary: bool = False
     # Section introduced by a "diff --git" / "Binary files" preamble:
@@ -348,26 +357,37 @@ class _DiffParser:
                 prev_body_kind = None
                 prev_added = None
 
-        def close_file() -> None:
+        def close_file(decision_line: Optional[int] = None) -> None:
             nonlocal current
             close_hunk()
             if current is not None:
+                # '---' / '+++' pairing state for this file section.  A text
+                # hunk is only entered once both headers have been seen in
+                # order (checked where the hunk starts); a non-binary
+                # section ending after '---' without its '+++' is rejected
+                # as soon as that becomes provable: the first line of the
+                # next section, or the '---' line itself at end of input.
+                # Binary sections carry no text hunk and identify their
+                # paths via their preamble / 'Binary files' marker, so they
+                # never require the header pair.
+                if (
+                    not current.binary
+                    and current.minus_line is not None
+                    and current.plus_line is None
+                ):
+                    raise DiffParseError(
+                        decision_line
+                        or current.minus_line
+                        or current.header_line,
+                        "'---' header is not followed by a '+++' header",
+                    )
                 if current.from_preamble:
                     # Preambular sections may be empty new files or binary
                     # files that print no headers/hunks at all: valid.
                     self.files.append(current)
                     current = None
                     return
-                if current.new_path is None and not current.binary \
-                        and not current.hunks:
-                    # A bare '---' line without a following '+++' (or a
-                    # deletion patch missing its hunks) is truncated/garbage.
-                    raise DiffParseError(
-                        current.header_line,
-                        "'---' header is not followed by a '+++' header and hunks",
-                    )
-                if current.new_path is not None and not current.binary \
-                        and not current.hunks:
+                if not current.binary and not current.hunks:
                     raise DiffParseError(
                         current.plus_line or current.header_line,
                         "file header is not followed by any hunk",
@@ -430,6 +450,7 @@ class _DiffParser:
                         new_path=None,
                         header_line=lineno,
                         plus_line=None,
+                        minus_line=lineno,
                     )
                     state = _HEADERS
                     continue
@@ -452,7 +473,7 @@ class _DiffParser:
                     continue
                 if line.startswith("diff --git "):
                     # Empty/unchanged previous section ends; start the next.
-                    close_file()
+                    close_file(lineno)
                     old, new = _git_diff_paths(line, lineno)
                     current = FilePatch(
                         old_path=old, new_path=new, header_line=lineno,
@@ -470,6 +491,7 @@ class _DiffParser:
                     current.old_path, current.new_path = old, new
                     continue
                 if line.startswith("--- "):
+                    current.minus_line = lineno
                     current.old_path = _header_path(line, lineno)
                     state = _HEADERS
                     continue
@@ -495,7 +517,7 @@ class _DiffParser:
                     continue
                 if line.startswith("diff --git "):
                     # A next-file preamble ends the current (binary) patch.
-                    close_file()
+                    close_file(lineno)
                     old, new = _git_diff_paths(line, lineno)
                     current = FilePatch(
                         old_path=old, new_path=new, header_line=lineno,
@@ -513,6 +535,14 @@ class _DiffParser:
                     current.old_path, current.new_path = old, new
                     continue
                 if line.startswith("+++ "):
+                    if current.plus_line is not None:
+                        # The '---'/'+++' pair for this file is complete; a
+                        # second '+++' is a duplicated/garbled file header.
+                        raise DiffParseError(
+                            lineno,
+                            "duplicate '+++' header: the file header pair is "
+                            "already complete",
+                        )
                     current.new_path = _header_path(line, lineno)
                     current.plus_line = lineno
                     old, new = _strip_git_prefixes(
@@ -523,18 +553,22 @@ class _DiffParser:
                 if line.startswith("--- "):
                     raise DiffParseError(
                         lineno,
-                        "unexpected '---' header: previous file header has no "
-                        "'+++' header",
+                        "'---' header is not followed by a '+++' header",
                     )
                 if line.startswith("@@"):
-                    if current.new_path is None and current.old_path is None:
+                    # A text hunk needs the complete, correctly ordered
+                    # '---' then '+++' file header pair.  /dev/null on the
+                    # new side (a deletion) still carries a real '+++' line,
+                    # so new_path being None never excuses its absence.
+                    if current.plus_line is None:
                         raise DiffParseError(
-                            lineno, "hunk without any file header path"
+                            lineno,
+                            "hunk header without a preceding '+++' file header",
                         )
                     start_hunk(lineno, line)
                     continue
                 if line.startswith(("From ",)):
-                    close_file()
+                    close_file(lineno)
                     state = _OUT
                     continue
                 if line.startswith(_HEADER_PREFIXES):
@@ -551,7 +585,7 @@ class _DiffParser:
                     state = _PREAMBLE if current is not None else _OUT
                     continue
                 if line.startswith("diff --git "):
-                    close_file()
+                    close_file(lineno)
                     old, new = _git_diff_paths(line, lineno)
                     current = FilePatch(
                         old_path=old, new_path=new, header_line=lineno,
@@ -560,12 +594,13 @@ class _DiffParser:
                     state = _PREAMBLE
                     continue
                 if line.startswith("--- "):
-                    close_file()
+                    close_file(lineno)
                     current = FilePatch(
                         old_path=_header_path(line, lineno),
                         new_path=None,
                         header_line=lineno,
                         plus_line=None,
+                        minus_line=lineno,
                     )
                     state = _HEADERS
                     continue
@@ -626,7 +661,7 @@ class _DiffParser:
 
             if line.startswith("diff --git "):
                 # Next file section ends the current one.
-                close_file()
+                close_file(lineno)
                 old, new = _git_diff_paths(line, lineno)
                 current = FilePatch(
                     old_path=old, new_path=new, header_line=lineno,
@@ -639,7 +674,7 @@ class _DiffParser:
                 "--- "
             ) or line.startswith("+++ "):
                 # Current hunk/file ends; reprocess this line from OUT state.
-                close_file()
+                close_file(lineno)
                 state = _OUT
                 if line.startswith("--- "):
                     current = FilePatch(
@@ -647,6 +682,7 @@ class _DiffParser:
                         new_path=None,
                         header_line=lineno,
                         plus_line=None,
+                        minus_line=lineno,
                     )
                     state = _HEADERS
                 elif line.startswith("+++ "):

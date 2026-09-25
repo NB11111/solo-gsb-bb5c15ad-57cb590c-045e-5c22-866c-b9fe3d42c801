@@ -268,7 +268,10 @@ curl -s -X POST http://localhost:8000/api/v1/audits/diff \
   详见下文 SARIF 一节。
 - 纯删除文件、二进制补丁（`Binary files … differ` / `GIT binary patch` Base85 段）、
   空文件与无新增行的文件不产生记录（仍计入合法 diff）；所有文件都无新增内容时
-  返回 201、`file_count: 0`、`risk_level: "info"`。
+  返回 201、`file_count: 0`、`risk_level: "info"`。仅有元数据（模式/重命名/空文件
+  的 `diff --git` 段）或纯二进制的文件段本身不带 `---`/`+++` 文本头，同样合法；
+  但带文本 hunk 的文件段必须有成对、有序的 `---` 后接 `+++`（删除文件的
+  `+++ /dev/null` 也算），否则在首个可判定行返回 422。
 - git 的 `a/` `b/` 路径前缀与 C 风格引号路径会被还原：`diff --git` 行与
   `---`/`+++` 头部共用同一套解码——引号路径内的转义**按字节**解释（`\ooo` 八进制
   转义产生单个字节，`\"` `\\` `\t` 等简单转义照常），得到的字节序列再按 **UTF-8**
@@ -299,6 +302,7 @@ jq -Rs '{diff: .}' cafe.diff | \
 | 状态码 | 条件 |
 |---|---|
 | `422` | diff 结构非法（无文件段、hunk 头格式错误、hunk 出现在文件头之外、hunk 体行首字符非法、No-newline 标记位置/文本错误），或 hunk 体行数与头部声明的旧/新行数不一致 |
+| `422` | 文件头未成对：文本 hunk 所在文件段缺少按序出现的 `---` / `+++` 一对（如 `--- a/x.py` 后直接是 `@@` hunk、`---` 后到下一段仍无 `+++`），或 `+++` 重复出现；定位到**首个可判定的 diff 行**（缺失时为 hunk 头或下一段起始行，重复时为第二个 `+++` 行）。删除文件的 `+++ /dev/null` 仍属合法成对文件头 |
 | `422` | 引号路径非法：C 风格转义非法（如 `\x`）、八进制转义超过一个字节、引号未闭合，或转义解码后的字节序列不是合法 UTF-8（定位到对应 `diff --git` / `---` / `+++` 行） |
 | `422` | 请求体缺少 `diff` 字段（Pydantic 校验） |
 
@@ -310,6 +314,25 @@ jq -Rs '{diff: .}' cafe.diff | \
     "error": "invalid_unified_diff",
     "line": 4,
     "message": "hunk body exceeds the 1 new line(s) declared by its header"
+  }
+}
+```
+
+文件头未成对时（如 `--- a/x.py` 后直接出现 `@@` hunk，缺少 `+++`），定位到首个
+可判定的 diff 行（这里是第 2 行的 hunk 头），新增行不会因新路径为空而被静默丢弃：
+
+```
+--- a/x.py
+@@ -0,0 +1 @@
++added line
+```
+
+```json
+{
+  "detail": {
+    "error": "invalid_unified_diff",
+    "line": 2,
+    "message": "hunk header without a preceding '+++' file header"
   }
 }
 ```

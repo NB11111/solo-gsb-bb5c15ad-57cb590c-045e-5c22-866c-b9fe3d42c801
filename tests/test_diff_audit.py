@@ -272,6 +272,113 @@ def test_hunk_without_file_header_422(client):
     assert resp.json()["detail"]["line"] == 1
 
 
+def test_hunk_after_minus_header_without_plus_header_422(client):
+    # '--- a/x.py' directly followed by a hunk: the added lines used to be
+    # parsed and then silently dropped (new_path stayed None), returning
+    # success.  The missing '+++' must be rejected on the first hunk line.
+    diff = "--- a/x.py\n@@ -0,0 +1 @@\n+added line\n"
+    resp = client.post("/api/v1/audits/diff", json={"diff": diff})
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "invalid_unified_diff"
+    assert detail["line"] == 2  # the '@@' hunk header line
+    assert "+++" in detail["message"]
+    assert client.get("/api/v1/audits").json()["total"] == 0
+
+
+def test_minus_without_plus_before_next_file_422(client):
+    # The missing '+++' is only provable when the next section starts; the
+    # error points at the first line of that next section, and the preceding
+    # well-formed file is not persisted either.
+    diff = (
+        "diff --git a/ok b/ok\n--- a/ok\n+++ b/ok\n@@ -1 +1 @@\n-a\n+b\n"
+        "diff --git a/bad b/bad\n--- a/bad\n"
+        "diff --git a/next b/next\n--- a/next\n+++ b/next\n"
+        "@@ -1 +1 @@\n-a\n+b\n"
+    )
+    resp = client.post("/api/v1/audits/diff", json={"diff": diff})
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "invalid_unified_diff"
+    assert detail["line"] == 9  # the next "diff --git" line
+    assert client.get("/api/v1/audits").json()["total"] == 0
+
+
+def test_minus_without_plus_in_second_file_reports_hunk_line(client):
+    # A valid first file followed by a truncated second file: the hunk line
+    # of the second file is the first line proving its '+++' is missing.
+    diff = (
+        "diff --git a/ok b/ok\n--- a/ok\n+++ b/ok\n@@ -1 +1 @@\n-a\n+b\n"
+        "diff --git a/bad b/bad\n--- a/bad\n@@ -1 +1 @@\n-a\n+b\n"
+    )
+    resp = client.post("/api/v1/audits/diff", json={"diff": diff})
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "invalid_unified_diff"
+    assert detail["line"] == 9
+    assert client.get("/api/v1/audits").json()["total"] == 0
+
+
+def test_duplicate_plus_header_422(client):
+    diff = "--- a\n+++ b\n+++ c\n@@ -1 +1 @@\n-a\n+b\n"
+    resp = client.post("/api/v1/audits/diff", json={"diff": diff})
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "invalid_unified_diff"
+    assert detail["line"] == 3  # the second '+++' line
+    assert "+++" in detail["message"]
+
+
+def test_duplicate_minus_header_422(client):
+    # A completed '---'/'+++' pair cannot start over with another '---'.
+    diff = "--- a\n+++ b\n--- a2\n@@ -1 +1 @@\n-a\n+b\n"
+    resp = client.post("/api/v1/audits/diff", json={"diff": diff})
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["line"] == 3
+
+
+def test_dev_null_plus_header_still_allows_hunks(client):
+    # A deletion keeps a real '+++ /dev/null' header line; its hunks must
+    # parse, and a following valid file is unaffected.
+    diff = (
+        "diff --git a/gone.txt b/gone.txt\ndeleted file mode 100644\n"
+        "--- a/gone.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n"
+        "diff --git a/plain.txt b/plain.txt\n"
+        "--- a/plain.txt\n+++ b/plain.txt\n@@ -1 +1 @@\n-x\n+y\n"
+    )
+    body = client.post("/api/v1/audits/diff", json={"diff": diff}).json()
+    assert body["file_count"] == 1
+    assert body["items"][0]["path"] == "plain.txt"
+
+
+def test_metadata_and_binary_sections_without_headers_remain_valid(client):
+    # Metadata-only (mode change, empty file) and binary sections print no
+    # '---'/'+++' pair; they stay legal, and following text files still work.
+    diff = (
+        "diff --git a/empty b/empty\nnew file mode 100644\n"
+        "index 0000000..e69de29\n"
+        "diff --git a/img.png b/img.png\nnew file mode 100644\n"
+        "index 0000000..1111111\nBinary files /dev/null and b/img.png differ\n"
+        "diff --git a/t.txt b/t.txt\n--- a/t.txt\n+++ b/t.txt\n"
+        "@@ -1 +1 @@\n-a\n+b\n"
+    )
+    body = client.post("/api/v1/audits/diff", json={"diff": diff}).json()
+    assert [i["path"] for i in body["items"]] == ["t.txt"]
+
+
+def test_binary_section_after_minus_header_without_plus_is_valid(client):
+    # A '---' followed directly by a binary marker (no text hunk, no '+++')
+    # is still a binary file section, not a truncated text patch.
+    diff = (
+        "diff --git a/img.png b/img.png\n--- a/img.png\n"
+        "Binary files a/img.png and b/img.png differ\n"
+        "diff --git a/t.txt b/t.txt\n--- a/t.txt\n+++ b/t.txt\n"
+        "@@ -1 +1 @@\n-a\n+b\n"
+    )
+    body = client.post("/api/v1/audits/diff", json={"diff": diff}).json()
+    assert [i["path"] for i in body["items"]] == ["t.txt"]
+
+
 def test_plus_header_without_minus_header_422(client):
     resp = client.post(
         "/api/v1/audits/diff", json={"diff": "+++ b/x\n@@ -1 +1 @@\n+a\n"}
