@@ -7,6 +7,14 @@ start with ``+``) are audited: file headers, removed lines (``-``),
 context lines (a leading space) and the ``\\ No newline at end of file``
 marker are parsed for structure but never analysed.
 
+Every text hunk must be preceded by a complete ``---``/``+++`` file-header
+pair, in that order: the parser tracks the pairing state of each file
+section and refuses to enter a hunk while the ``+++`` half is still
+missing (its added lines would otherwise have no new-file path and be
+silently dropped).  A missing or duplicated file header is reported at
+the first diff line where the problem becomes visible.  A ``+++ /dev/null``
+deletion header completes the pair exactly like a regular path.
+
 For every file containing added lines the added text is rebuilt in
 new-file order and fed to :func:`app.bidi.parse_bidi`.  Every parser
 finding (control character, error, dangerous span) is then mapped back to
@@ -358,18 +366,17 @@ class _DiffParser:
                     self.files.append(current)
                     current = None
                     return
-                if current.new_path is None and not current.binary \
-                        and not current.hunks:
-                    # A bare '---' line without a following '+++' (or a
-                    # deletion patch missing its hunks) is truncated/garbage.
+                if current.plus_line is None and not current.binary:
+                    # A bare '---' line without the '+++' half of the
+                    # header pair is truncated/garbage.
                     raise DiffParseError(
                         current.header_line,
-                        "'---' header is not followed by a '+++' header and hunks",
+                        "'---' header is not followed by a '+++' header",
                     )
-                if current.new_path is not None and not current.binary \
+                if current.plus_line is not None and not current.binary \
                         and not current.hunks:
                     raise DiffParseError(
-                        current.plus_line or current.header_line,
+                        current.plus_line,
                         "file header is not followed by any hunk",
                     )
                 self.files.append(current)
@@ -513,6 +520,12 @@ class _DiffParser:
                     current.old_path, current.new_path = old, new
                     continue
                 if line.startswith("+++ "):
+                    if current.plus_line is not None:
+                        raise DiffParseError(
+                            lineno,
+                            "duplicate '+++' header: the '---'/'+++' pair "
+                            "is already complete",
+                        )
                     current.new_path = _header_path(line, lineno)
                     current.plus_line = lineno
                     old, new = _strip_git_prefixes(
@@ -521,12 +534,26 @@ class _DiffParser:
                     current.old_path, current.new_path = old, new
                     continue
                 if line.startswith("--- "):
+                    if current.plus_line is None:
+                        raise DiffParseError(
+                            lineno,
+                            "unexpected '---' header: previous file header "
+                            "has no '+++' header",
+                        )
                     raise DiffParseError(
                         lineno,
-                        "unexpected '---' header: previous file header has no "
-                        "'+++' header",
+                        "duplicate '---' header: the '---'/'+++' pair is "
+                        "already complete",
                     )
                 if line.startswith("@@"):
+                    if current.plus_line is None:
+                        # Entering a text hunk before the '+++' half of
+                        # the pair would leave its added lines without a
+                        # new-file path, silently dropping them.
+                        raise DiffParseError(
+                            lineno,
+                            "hunk header without a preceding '+++' header",
+                        )
                     if current.new_path is None and current.old_path is None:
                         raise DiffParseError(
                             lineno, "hunk without any file header path"

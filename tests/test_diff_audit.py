@@ -4,8 +4,10 @@ Covers: multi-file/multi-hunk parsing, added-only analysis (removed and
 context lines ignored), new-file line progression, "No newline" markers,
 finding -> path/line/column/diff-line mapping with preserved logical
 indices, one record per file, summary max risk, 422 on structural errors
-and hunk-count mismatches (first error line, no writes), deleted files
-and binary diffs producing no records, and stored meta/verify interplay.
+(including missing/duplicated '---'/'+++' file headers, reported at the
+first diff line that proves the pair broken) and hunk-count mismatches
+(first error line, no writes), deleted files and binary diffs producing
+no records, and stored meta/verify interplay.
 """
 
 RLO = "‮"
@@ -278,6 +280,89 @@ def test_plus_header_without_minus_header_422(client):
     )
     assert resp.status_code == 422
     assert resp.json()["detail"]["line"] == 1
+
+
+def test_hunk_after_minus_header_without_plus_header_422(client):
+    # '--- a/x.py' directly followed by a hunk: the missing '+++'
+    # header must be rejected at the first line that proves it absent
+    # (the hunk header), not silently accepted with the added lines
+    # dropped for lack of a new-file path.
+    diff = "--- a/x.py\n@@ -1 +1 @@\n-old\n+new\n"
+    resp = client.post("/api/v1/audits/diff", json={"diff": diff})
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "invalid_unified_diff"
+    assert detail["line"] == 2  # the hunk header line
+    assert client.get("/api/v1/audits").json()["total"] == 0
+
+
+def test_hunk_after_minus_header_without_plus_header_git_422(client):
+    # Same incomplete pair inside a git preamble section.
+    diff = (
+        "diff --git a/x.py b/x.py\n"
+        "--- a/x.py\n"
+        "@@ -1 +1 @@\n-old\n+new\n"
+    )
+    resp = client.post("/api/v1/audits/diff", json={"diff": diff})
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["line"] == 3
+    assert client.get("/api/v1/audits").json()["total"] == 0
+
+
+def test_missing_plus_header_in_second_file_writes_nothing(client):
+    # The first file is well formed, but the whole multi-file request
+    # must fail and persist nothing.
+    diff = (
+        "diff --git a/ok b/ok\n--- a/ok\n+++ b/ok\n@@ -1 +1 @@\n-a\n+b\n"
+        "diff --git a/bad b/bad\n--- a/bad\n@@ -1 +1 @@\n-c\n+d\n"
+    )
+    resp = client.post("/api/v1/audits/diff", json={"diff": diff})
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["line"] == 9  # the orphan hunk header
+    assert client.get("/api/v1/audits").json()["total"] == 0
+
+
+def test_duplicate_plus_header_422(client):
+    diff = "--- a/x\n+++ b/x\n+++ b/y\n@@ -1 +1 @@\n-a\n+b\n"
+    resp = client.post("/api/v1/audits/diff", json={"diff": diff})
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail["error"] == "invalid_unified_diff"
+    assert detail["line"] == 3  # the repeated '+++' line
+    assert client.get("/api/v1/audits").json()["total"] == 0
+
+
+def test_duplicate_minus_header_422(client):
+    # '---' repeated before its pair completed ...
+    diff = "--- a/x\n--- a/y\n+++ b/y\n@@ -1 +1 @@\n-a\n+b\n"
+    resp = client.post("/api/v1/audits/diff", json={"diff": diff})
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["line"] == 2
+
+
+def test_minus_header_after_complete_pair_422(client):
+    # ... and '---' repeated after the pair completed.
+    diff = "--- a/x\n+++ b/x\n--- a/y\n@@ -1 +1 @@\n-a\n+b\n"
+    resp = client.post("/api/v1/audits/diff", json={"diff": diff})
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["line"] == 3
+
+
+def test_bare_minus_header_at_eof_422(client):
+    resp = client.post("/api/v1/audits/diff", json={"diff": "--- a/x.py\n"})
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["line"] == 1
+
+
+def test_deletion_header_pair_without_hunks_422(client):
+    # '+++ /dev/null' completes the pair, so the missing hunks are
+    # reported against the '+++' line (not as a missing '+++').
+    resp = client.post(
+        "/api/v1/audits/diff",
+        json={"diff": "--- a/gone\n+++ /dev/null\n"},
+    )
+    assert resp.status_code == 422
+    assert resp.json()["detail"]["line"] == 2
 
 
 def test_invalid_body_prefix_422(client):
